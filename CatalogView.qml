@@ -464,9 +464,11 @@ Item {
     id: folderPicker
     currentFolder: "file://" + Quickshell.env("HOME")
     onAccepted: {
-      var localPath = selectedFolder.toLocalFile()
-      if (root.controller) root.controller.scanPath(localPath)
+      root.restoreLibraryPanel()
+      var path = root.localFilePath(selectedFolder)
+      if (path && root.controller) root.controller.scanPath(path)
     }
+    onRejected: root.restoreLibraryPanel()
   }
 
   FileDialog {
@@ -655,7 +657,7 @@ Item {
           ActionButton {
             text: "Scan a folder…"
             enabled: root.controller && !root.controller.commandRunning
-            onClicked: folderPicker.open()
+            onClicked: root.openLibraryPicker(folderPicker)
           }
         }
 
@@ -1314,7 +1316,7 @@ Item {
         EditInput {
           id: editArtist
           Layout.fillWidth: true
-          maximumLength: 240
+          maximumLength: 4096
           enabled: !root.editBulk || changeArtist.checked
           placeholderText: root.editBulk && !changeArtist.checked ? "Unchanged" : ""
         }

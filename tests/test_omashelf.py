@@ -43,6 +43,44 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(omashelf.search("_", "")["results"], [])
         self.assertEqual(len(omashelf.search("", "", result["diskId"])["results"]), 2)
 
+    def test_scan_limit_stops_before_visiting_sibling_directories_and_allows_backups(self):
+        media = self.media_dir / "limited"
+        for name in ("a", "b", "c"):
+            directory = media / name
+            directory.mkdir(parents=True)
+            for index in range(3):
+                (directory / f"example-{index}.txt").write_bytes(b"fixture")
+        with (
+            patch.object(omashelf, "MAX_FILES", 2),
+            patch.object(omashelf, "mount_for_path", return_value={}),
+        ):
+            result = omashelf.scan_directory(str(media))
+            self.assertEqual(result["files"], 2)
+            self.assertTrue(result["partial"])
+            self.assertEqual(len(result["errors"]), 1)
+            self.assertIn("safety limit", result["errors"][0])
+            path = Path(self.temporary.name) / "limited.json"
+            self.assertEqual(omashelf.export_library(str(path))["fileCount"], 2)
+            disks, _ = omashelf.read_library(str(path))
+            self.assertEqual(len(disks[0]["files"]), 2)
+            self.assertTrue(all(file["path"].startswith("a/") for file in disks[0]["files"]))
+
+    def test_overview_exposes_the_entire_library_beyond_500_discs(self):
+        ids = {f"fixture:{index}" for index in range(501)}
+        with omashelf.connect() as db:
+            db.executemany(
+                "INSERT INTO disks(id, label, path, kind, scanned_at) "
+                "VALUES (?, ?, 'Shelf A', 'data', datetime('now'))",
+                [(disk_id, f"Fictional disc {index:03d}") for index, disk_id in enumerate(sorted(ids))],
+            )
+        with (
+            patch.object(omashelf, "mount_entries", return_value=[]),
+            patch.object(omashelf, "optical_drives", return_value=[]),
+        ):
+            overview = omashelf.overview()
+        self.assertEqual(overview["diskCount"], 501)
+        self.assertEqual({disk["id"] for disk in overview["disks"]}, ids)
+
     def test_term_filters_match_all_terms_and_can_be_removed(self):
         (self.media_dir / "A song [studio].mp3").write_bytes(b"audio")
         with patch.object(omashelf, "mount_for_path", return_value={}):
@@ -131,11 +169,38 @@ class CatalogTests(unittest.TestCase):
             row = db.execute("SELECT path FROM disks WHERE id = ?", (disk_id,)).fetchone()
         self.assertEqual(row["path"], "CD wallet")
 
+    def test_long_musicbrainz_credits_survive_editing_and_json_xml_backups(self):
+        tracks = [{"number": 1, "length": 1000, "offset": 150}]
+        credits = [{"name": f"Fictional performer {index} " + "\U0001f3b5" * 216} for index in range(8)]
+        artist = ", ".join(credit["name"] for credit in credits)
+        self.assertGreater(len(artist), 240)
+        response = {"releases": [{"title": "Ensemble album", "artist-credit": credits}]}
+        with (
+            patch.object(omashelf, "read_audio_toc", return_value=(tracks, 1150)),
+            patch.object(omashelf, "fetch_json", return_value=response),
+        ):
+            result = omashelf.identify_audio("/dev/sr0")
+        self.assertEqual(result["artist"], artist)
+        disk_id = result["diskId"]
+        omashelf.edit_disk(disk_id, self.edit_values(disk_id, label="Edited ensemble album"))
+        for suffix in ("json", "xml"):
+            with self.subTest(format=suffix):
+                path = Path(self.temporary.name) / f"ensemble.{suffix}"
+                omashelf.export_library(str(path))
+                disks, _ = omashelf.read_library(str(path))
+                self.assertEqual(disks[0]["artist"], artist)
+                self.assertEqual(disks[0]["edits"]["label"], "Edited ensemble album")
+                preview = omashelf.inspect_import(str(path))
+                omashelf.import_library(str(path), "replace", "keep", preview["fingerprint"])
+                with omashelf.connect() as db:
+                    row = db.execute("SELECT artist FROM disks WHERE id = ?", (disk_id,)).fetchone()
+                self.assertEqual(row["artist"], artist)
+
     def test_invalid_edits_leave_catalog_unchanged(self):
         with patch.object(omashelf, "mount_for_path", return_value={}):
             disk_id = omashelf.scan_directory(str(self.media_dir))["diskId"]
         for changes in (
-            {"label": ""}, {"path": " "}, {"label": "x" * 241},
+            {"label": ""}, {"path": " "}, {"label": "x" * 241}, {"artist": "x" * 4097},
             {"disc_number": 2, "disc_count": 1}, {"disc_number": 1},
             {"disc_number": 1, "disc_count": 2},
             {"disc_number": True, "disc_count": 2},

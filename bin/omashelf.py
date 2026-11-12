@@ -101,7 +101,7 @@ def connect() -> sqlite3.Connection:
     return db
 
 
-EDIT_FIELDS = {"label": 240, "artist": 240, "path": 4096}
+EDIT_FIELDS = {"label": 240, "artist": 4096, "path": 4096}
 
 
 def apply_disk_edits(db: sqlite3.Connection, disk_id: str) -> sqlite3.Row:
@@ -371,8 +371,9 @@ def scan_directory(path_text: str) -> dict[str, object]:
                         errors.append(f"{file_path}: {error}")
                 if len(found) >= MAX_FILES:
                     errors.append(f"Stopped at the {MAX_FILES:,}-file safety limit.")
-                    directories[:] = []
                     break
+            if len(found) >= MAX_FILES:
+                break
 
         with connect() as db:
             db.execute(
@@ -668,7 +669,7 @@ def overview() -> dict[str, object]:
     for item in mounted:
         item["catalogued"] = item["id"] in ids
     return {
-        "disks": disks[:500],
+        "disks": disks,
         "diskCount": len(disks),
         "fileCount": file_count,
         "mounted": mounted,
@@ -885,7 +886,7 @@ def validate_library(document: object) -> list[dict[str, object]]:
     seen = set()
     total_files = 0
     limits = {"id": 256, "label": 240, "source": 4096, "path": 4096, "kind": 10,
-              "scanned_at": 32, "artist": 240, "external_url": 4096}
+              "scanned_at": 32, "artist": EDIT_FIELDS["artist"], "external_url": 4096}
     for disk in disks:
         if not isinstance(disk, dict) or set(disk) != {*LIBRARY_FIELDS, "tags", "edits", "cover", "files"}:
             raise ValueError("An imported disc has missing or unsupported fields.")
