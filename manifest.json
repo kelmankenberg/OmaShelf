@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "kel.omashelf",
+  "name": "OmaShelf",
+  "version": "0.1.0",
+  "author": "Kelly",
+  "description": "Catalog data discs and audio CDs with offline search, tags, MusicBrainz identification, and JSON/XML backups.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaShelf",
+    "description": "Catalog mounted media and audio CDs.",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
