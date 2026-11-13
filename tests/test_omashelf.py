@@ -1,7 +1,10 @@
 import importlib.util
 import json
 import copy
+import os
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +35,84 @@ class CatalogTests(unittest.TestCase):
         )
         self.data_patch.start()
         self.addCleanup(self.data_patch.stop)
+
+    def run_stdin(self, request, *, umask=0o022):
+        environment = {**os.environ, "OMASHELF_DATA_DIR": str(self.data_dir)}
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--stdin"], input=request,
+            capture_output=True, env=environment, umask=umask, timeout=15,
+        )
+
+    def test_existing_catalog_is_made_private_without_changing_content(self):
+        self.data_dir.mkdir(mode=0o755)
+        with omashelf.sqlite3.connect(omashelf.DB_PATH) as db:
+            db.execute("CREATE TABLE private_fixture (value TEXT NOT NULL)")
+            db.execute("INSERT INTO private_fixture VALUES ('existing data')")
+        self.data_dir.chmod(0o755)
+        omashelf.DB_PATH.chmod(0o644)
+        result = self.run_stdin(b'["overview"]\n')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.assertEqual(stat.S_IMODE(self.data_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(omashelf.DB_PATH.stat().st_mode), 0o600)
+        with omashelf.sqlite3.connect(omashelf.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT value FROM private_fixture").fetchone()[0], "existing data")
+
+    def test_new_catalog_and_scan_status_are_private_under_permissive_umask(self):
+        request = json.dumps(["scan", str(self.media_dir)]).encode() + b"\n"
+        result = self.run_stdin(request, umask=0o000)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["files"], 2)
+        self.assertEqual(stat.S_IMODE(self.data_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(omashelf.DB_PATH.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(omashelf.STATUS_PATH.stat().st_mode), 0o600)
+
+    def test_stdin_request_preserves_private_unicode_text_and_rejects_bad_requests(self):
+        with patch.object(omashelf, "mount_for_path", return_value={}):
+            disk_id = omashelf.scan_directory(str(self.media_dir))["diskId"]
+        private_artist = "Private artist \U0001f3b5"
+        values = self.edit_values(disk_id, artist=private_artist, tags=["Private tag"])
+        request = ["edit-disk", disk_id, json.dumps(values, ensure_ascii=False)]
+        result = self.run_stdin(json.dumps(request, ensure_ascii=False).encode() + b"\n")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = self.run_stdin(json.dumps(["search-terms", disk_id, "Private tag"]).encode() + b"\n")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(json.loads(result.stdout)["results"]), 2)
+        with omashelf.connect() as db:
+            self.assertEqual(db.execute("SELECT artist FROM disks").fetchone()[0], private_artist)
+        for invalid in (b'{"not":"an array"}\n', b'["search-terms", 1]\n',
+                        b'["overview"]', b"x" * (omashelf.MAX_REQUEST_BYTES + 1)):
+            with self.subTest(length=len(invalid)):
+                response = self.run_stdin(invalid)
+                self.assertNotEqual(response.returncode, 0)
+                self.assertFalse(json.loads(response.stdout)["ok"])
+
+    def test_catalog_symlinks_are_rejected_without_changing_their_targets(self):
+        self.data_dir.mkdir()
+        target = Path(self.temporary.name) / "existing-file"
+        target.write_text("unchanged", encoding="utf-8")
+        target.chmod(0o644)
+        omashelf.DB_PATH.symlink_to(target)
+        response = self.run_stdin(b'["overview"]\n')
+        self.assertNotEqual(response.returncode, 0)
+        self.assertFalse(json.loads(response.stdout)["ok"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_mount_lookup_does_not_pass_the_scanned_path_in_process_arguments(self):
+        mount = self.media_dir / "nested"
+        mount.mkdir()
+        fixture = {"filesystems": [
+            {"target": "/", "source": "/dev/root"},
+            {"target": str(self.media_dir), "source": "/dev/outer"},
+            {"target": str(mount), "source": "/dev/inner"},
+        ]}
+        process_result = subprocess.CompletedProcess([], 0, stdout=json.dumps(fixture), stderr="")
+        with patch.object(omashelf.subprocess, "run", return_value=process_result) as run:
+            result = omashelf.mount_for_path(mount / "private filename")
+        self.assertEqual(result["SOURCE"], "/dev/inner")
+        self.assertNotIn(str(mount), run.call_args.args[0])
+        self.assertNotIn("private filename", " ".join(run.call_args.args[0]))
 
     def test_scanning_and_two_independent_literal_search_filters(self):
         with patch.object(omashelf, "mount_for_path", return_value={}):

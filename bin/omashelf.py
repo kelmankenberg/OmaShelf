@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,7 @@ MAX_SEARCH_RESULTS = 500
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_ARTWORK_BYTES = 5_000_000
 MAX_LIBRARY_BYTES = 256 * 1024 * 1024
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
 LIBRARY_FIELDS = (
     "id", "label", "source", "path", "kind", "scanned_at", "file_count",
     "size_bytes", "artist", "external_url", "disc_number", "disc_count",
@@ -53,8 +55,27 @@ TRACK_ROW = re.compile(
 )
 
 
+def ensure_private_data_dir() -> None:
+    DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(DATA_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if os.fstat(fd).st_uid != os.geteuid():
+            raise PermissionError("OmaShelf's data directory must be owned by the current user.")
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
 def connect() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_data_dir()
+    fd = os.open(DB_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError("OmaShelf's catalog must be a regular file owned by the current user.")
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
     db = sqlite3.connect(DB_PATH, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
@@ -226,7 +247,7 @@ def edit_disks(disk_ids: object, changes: object, *, only_changes: bool = False)
 
 
 def write_json(path: Path, value: object) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_data_dir()
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=DATA_DIR, delete=False
     ) as stream:
@@ -307,7 +328,7 @@ def volume_key(source: str, uuid: str = "") -> str:
 def mount_for_path(path: Path) -> dict[str, str]:
     result = subprocess.run(
         [
-            "findmnt", "--json", "--target", str(path),
+            "findmnt", "--json", "--list",
             "--output", "SOURCE,TARGET,FSTYPE,LABEL,UUID",
         ],
         check=True,
@@ -316,9 +337,13 @@ def mount_for_path(path: Path) -> dict[str, str]:
         timeout=5,
     )
     entries = json.loads(result.stdout).get("filesystems", [])
-    if not entries:
+    matching = [
+        entry for entry in entries
+        if entry.get("target") and path.is_relative_to(Path(entry["target"]))
+    ]
+    if not matching:
         return {}
-    entry = entries[0]
+    entry = max(matching, key=lambda item: len(Path(item["target"]).parts))
     return {key: str(entry.get(key.lower()) or "") for key in ("SOURCE", "TARGET", "FSTYPE", "LABEL", "UUID")}
 
 
@@ -1075,14 +1100,30 @@ def dispatch(arguments: list[str]) -> dict[str, object]:
 
 def main() -> int:
     try:
-        print(json.dumps({"ok": True, **dispatch(sys.argv[1:])}, ensure_ascii=False))
+        os.umask(0o077)
+        ensure_private_data_dir()
+        arguments = sys.argv[1:]
+        if arguments == ["--stdin"]:
+            request = sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1)
+            if len(request) > MAX_REQUEST_BYTES or not request.endswith(b"\n"):
+                raise ValueError("Invalid or oversized OmaShelf request.")
+            arguments = json.loads(request)
+            if not isinstance(arguments, list) or not arguments or any(
+                not isinstance(argument, str) for argument in arguments
+            ):
+                raise ValueError("Invalid OmaShelf request.")
+        print(json.dumps({"ok": True, **dispatch(arguments)}, ensure_ascii=False))
         return 0
     except (
         OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError,
         urllib.error.URLError, json.JSONDecodeError,
     ) as error:
-        set_scanning(False)
-        print(json.dumps({"ok": False, "error": str(error)[:1000]}, ensure_ascii=False))
+        message = str(error)
+        try:
+            set_scanning(False)
+        except OSError as status_error:
+            message += f" Could not reset scan status: {status_error}"
+        print(json.dumps({"ok": False, "error": message[:1000]}, ensure_ascii=False))
         return 1
 
 

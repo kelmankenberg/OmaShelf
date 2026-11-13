@@ -160,6 +160,12 @@ and downloaded artwork under:
 
 It honors `XDG_DATA_HOME`. For development, `OMASHELF_DATA_DIR` overrides the
 entire storage directory; the shell and backend must see the same setting.
+OmaShelf restricts its data directory to its owner (`0700`) and its catalog
+database to owner read/write (`0600`), including existing installations.
+Choose a dedicated directory for `OMASHELF_DATA_DIR`; its permissions will be
+restricted. GUI requests pass through a private stdin pipe rather than process
+arguments. Exported backups contain private catalog data and should be stored
+accordingly.
 
 Cataloging and searching are local. Only explicit audio identification contacts
 MusicBrainz with a disc ID and retrieves available artwork from Cover Art

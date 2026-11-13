@@ -38,6 +38,7 @@ Panel {
   property bool refreshPending: false
   property string commandOutput: ""
   property string commandError: ""
+  property string commandRequest: ""
   signal diskEditFinished(string diskId, bool saved, string error)
   signal bulkEditFinished(bool saved, string error)
   signal importInspected(var preview, string error)
@@ -65,7 +66,8 @@ Panel {
     if (action === "edit-disk") editingDiskId = args[0]
     commandRunning = true
     if (action !== "overview" && action !== "search-terms") errorMessage = ""
-    process.command = ["python3", helperPath, action].concat(args || [])
+    commandRequest = JSON.stringify([action].concat(args || [])) + "\n"
+    process.command = ["python3", helperPath, "--stdin"]
     process.running = true
     return true
   }
@@ -327,6 +329,7 @@ Panel {
 
   Process {
     id: process
+    stdinEnabled: true
     stdout: SplitParser {
       onRead: function(line) { root.commandOutput += line + "\n" }
     }
@@ -336,6 +339,8 @@ Panel {
     onStarted: {
       root.commandOutput = ""
       root.commandError = ""
+      write(root.commandRequest)
+      root.commandRequest = ""
     }
     onExited: function(exitCode) {
       Qt.callLater(function() { root.finishCommand(exitCode) })
